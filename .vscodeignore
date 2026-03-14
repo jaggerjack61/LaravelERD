@@ -1,8 +1,10 @@
 .vscode/**
 .vscode-test/**
 src/**
+scripts/**
 out/maps/**
 .gitignore
 tsconfig.json
 webpack.config.js
 plan.md
+media/store_icon.png
