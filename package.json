@@ -4,6 +4,11 @@
   "description": "Interactive Entity Relationship Diagram generator for Laravel projects",
   "version": "0.1.0",
   "publisher": "samueljarai",
+  "icon": "media/store_icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jaggerjack61/LaravelERD.git"
+  },
   "engines": {
     "vscode": "^1.80.0"
   },
