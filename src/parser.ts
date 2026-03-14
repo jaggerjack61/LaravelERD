@@ -34,6 +34,20 @@ function parseModifiers(chain: string): { nullable: boolean; unique: boolean; de
   };
 }
 
+// Recursively collect all .php files from a directory
+function collectPhpFiles(dir: string): string[] {
+  const results: string[] = [];
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const fullPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      results.push(...collectPhpFiles(fullPath));
+    } else if (entry.name.endsWith('.php')) {
+      results.push(fullPath);
+    }
+  }
+  return results;
+}
+
 export function parseMigration(content: string, filePath: string): Entity | null {
   // Find Schema::create / Schema::table
   const createMatch = content.match(/Schema::create\s*\(\s*['"]([^'"]+)['"]/);
@@ -301,10 +315,9 @@ export async function parseProject(workspacePath: string): Promise<Schema> {
 
   for (const modelDir of modelDirs) {
     if (!fs.existsSync(modelDir)) continue;
-    const files = fs.readdirSync(modelDir).filter(f => f.endsWith('.php'));
-    for (const file of files) {
+    const files = collectPhpFiles(modelDir);
+    for (const filePath of files) {
       try {
-        const filePath = path.join(modelDir, file);
         const content = fs.readFileSync(filePath, 'utf8');
         const modelData = parseModel(content, filePath);
         if (!modelData || !modelData.name) continue;

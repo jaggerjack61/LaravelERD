@@ -41,7 +41,7 @@ export function activate(context: vscode.ExtensionContext): void {
   // FileSystemWatcher for migrations and models
   if (workspaceRoot) {
     watcher = vscode.workspace.createFileSystemWatcher(
-      new vscode.RelativePattern(workspaceRoot, '{database/migrations/*.php,app/Models/*.php,app/*.php}')
+      new vscode.RelativePattern(workspaceRoot, '{database/migrations/*.php,app/Models/**/*.php,app/*.php}')
     );
     const onChanged = () => ErdPanel.refresh();
     watcher.onDidChange(onChanged);
