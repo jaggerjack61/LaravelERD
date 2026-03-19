@@ -2,7 +2,7 @@
   "name": "laravel-erd",
   "displayName": "Laravel ERD",
   "description": "Interactive Entity Relationship Diagram generator for Laravel projects",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "publisher": "samueljarai",
   "icon": "media/store_icon_128.png",
   "repository": {
@@ -12,7 +12,10 @@
   "engines": {
     "vscode": "^1.80.0"
   },
-  "categories": ["Visualization", "Other"],
+  "categories": [
+    "Visualization",
+    "Other"
+  ],
   "activationEvents": [
     "workspaceContains:artisan"
   ],
@@ -73,7 +76,9 @@
   "devDependencies": {
     "@types/node": "^20.0.0",
     "@types/vscode": "^1.80.0",
+    "@vitest/coverage-v8": "^4.1.0",
     "sharp": "^0.34.4",
-    "typescript": "^5.3.0"
+    "typescript": "^5.3.0",
+    "vitest": "^4.1.0"
   }
 }

@@ -1,16 +1,19 @@
 import * as vscode from 'vscode';
-import * as path from 'path';
-import * as fs from 'fs';
 import { ErdPanel } from './erdPanel';
+import { getLaravelWorkspaceRoots, isLaravelProjectPath, resolveWorkspaceRoot } from './workspaceRoot';
 
-let watcher: vscode.FileSystemWatcher | undefined;
+let watchers: vscode.FileSystemWatcher[] = [];
 
 export function activate(context: vscode.ExtensionContext): void {
   const workspaceFolders = vscode.workspace.workspaceFolders;
-  const workspaceRoot = workspaceFolders?.[0]?.uri.fsPath;
+  const getWorkspaceRoot = (): string | undefined => resolveWorkspaceRoot(
+    vscode.workspace.workspaceFolders,
+    vscode.window.activeTextEditor?.document.uri.fsPath
+  );
+  const laravelWorkspaceRoots = getLaravelWorkspaceRoots(workspaceFolders);
 
   // Register welcome tree view
-  const treeProvider = new LaravelErdTreeProvider(workspaceRoot);
+  const treeProvider = new LaravelErdTreeProvider(getWorkspaceRoot());
   context.subscriptions.push(
     vscode.window.registerTreeDataProvider('laravelErd.welcome', treeProvider)
   );
@@ -18,11 +21,12 @@ export function activate(context: vscode.ExtensionContext): void {
   // Command: Open ERD
   context.subscriptions.push(
     vscode.commands.registerCommand('laravelErd.openErd', () => {
+      const workspaceRoot = getWorkspaceRoot();
       if (!workspaceRoot) {
         vscode.window.showErrorMessage('No workspace folder open.');
         return;
       }
-      if (!isLaravelProject(workspaceRoot)) {
+      if (!isLaravelProjectPath(workspaceRoot)) {
         vscode.window.showWarningMessage(
           'Laravel ERD: No artisan file detected. Make sure this is a Laravel project.'
         );
@@ -39,33 +43,28 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   // FileSystemWatcher for migrations and models
-  if (workspaceRoot) {
-    watcher = vscode.workspace.createFileSystemWatcher(
+  for (const workspaceRoot of laravelWorkspaceRoots) {
+    const watcher = vscode.workspace.createFileSystemWatcher(
       new vscode.RelativePattern(workspaceRoot, '{database/migrations/*.php,app/Models/**/*.php,app/*.php}')
     );
     const onChanged = () => ErdPanel.refresh();
     watcher.onDidChange(onChanged);
     watcher.onDidCreate(onChanged);
     watcher.onDidDelete(onChanged);
+    watchers.push(watcher);
     context.subscriptions.push(watcher);
   }
 
   // Auto-open if Laravel project detected on startup
-  if (workspaceRoot && isLaravelProject(workspaceRoot)) {
+  if (laravelWorkspaceRoots.length > 0) {
     // Don't auto-open panel but show notification
     treeProvider.setHasLaravel(true);
   }
 }
 
 export function deactivate(): void {
-  watcher?.dispose();
-}
-
-function isLaravelProject(workspaceRoot: string): boolean {
-  return (
-    fs.existsSync(path.join(workspaceRoot, 'artisan')) ||
-    fs.existsSync(path.join(workspaceRoot, 'database', 'migrations'))
-  );
+  watchers.forEach(watcher => watcher.dispose());
+  watchers = [];
 }
 
 class LaravelErdTreeProvider implements vscode.TreeDataProvider<vscode.TreeItem> {

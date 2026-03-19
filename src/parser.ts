@@ -3,7 +3,7 @@ import * as path from 'path';
 import { Schema, Entity, Column, Relationship, RelationshipType } from './schema';
 
 // Convert Laravel class name to table name (convention)
-function classToTable(name: string): string {
+export function classToTable(name: string): string {
   const snake = name
     .replace(/([A-Z])/g, (m, p, offset) => (offset > 0 ? '_' : '') + p.toLowerCase())
     .replace(/^_/, '');
