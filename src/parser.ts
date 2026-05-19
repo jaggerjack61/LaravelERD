@@ -1,24 +1,126 @@
-import * as fs from 'fs';
+import * as fsp from 'fs/promises';
 import * as path from 'path';
-import { Schema, Entity, Column, Relationship, RelationshipType } from './schema';
+import { Schema, Entity, Column, Relationship, RelationshipType, PendingForeignKey } from './schema';
+
+const IRREGULAR_PLURALS: Record<string, string> = {
+  person: 'people',
+  child: 'children',
+  goose: 'geese',
+  mouse: 'mice',
+  man: 'men',
+  woman: 'women',
+  tooth: 'teeth',
+  foot: 'feet',
+  ox: 'oxen',
+  cactus: 'cacti',
+  focus: 'foci',
+  analysis: 'analyses',
+  criterion: 'criteria',
+};
+
+const UNCOUNTABLE_TABLE_NAMES = new Set(['sheep', 'fish', 'deer', 'species', 'series']);
+const F_TO_VES_TABLE_NAMES = new Set(['knife', 'wolf', 'leaf', 'life', 'wife', 'half']);
+const ELOQUENT_BASE_CLASS_NAMES = new Set(['Model', 'Authenticatable', 'Pivot', 'MorphPivot']);
+const ELOQUENT_BASE_CLASS_PATHS = new Set([
+  'Illuminate\\Database\\Eloquent\\Model',
+  'Illuminate\\Database\\Eloquent\\Relations\\Pivot',
+  'Illuminate\\Database\\Eloquent\\Relations\\MorphPivot',
+  'Illuminate\\Foundation\\Auth\\User',
+]);
+
+function pluralizeSnakeSegment(segment: string): string {
+  if (UNCOUNTABLE_TABLE_NAMES.has(segment)) {
+    return segment;
+  }
+
+  const irregular = IRREGULAR_PLURALS[segment];
+  if (irregular) {
+    return irregular;
+  }
+
+  if (/[^aeiou]y$/.test(segment)) {
+    return segment.slice(0, -1) + 'ies';
+  }
+
+  if (F_TO_VES_TABLE_NAMES.has(segment)) {
+    return segment.replace(/(?:fe|f)$/, 'ves');
+  }
+
+  if (/[^z]z$/.test(segment)) {
+    return segment + 'zes';
+  }
+
+  if (/(?:s|sh|ch|x|z)$/.test(segment)) {
+    return segment + 'es';
+  }
+
+  return segment + 's';
+}
 
 // Convert Laravel class name to table name (convention)
 export function classToTable(name: string): string {
   const snake = name
     .replace(/([A-Z])/g, (m, p, offset) => (offset > 0 ? '_' : '') + p.toLowerCase())
     .replace(/^_/, '');
-  if (snake.endsWith('y') && !/[aeiou]y$/.test(snake)) {
-    return snake.slice(0, -1) + 'ies';
+  const parts = snake.split('_');
+  const lastPart = parts.pop();
+  if (!lastPart) {
+    return snake;
   }
-  if (/(?:s|sh|ch|x|z)$/.test(snake)) {
-    return snake + 'es';
-  }
-  return snake + 's';
+  return [...parts, pluralizeSnakeSegment(lastPart)].join('_');
 }
 
 // Extract string from quoted PHP - handles single and double quotes
 function unquote(s: string): string {
   return s.replace(/^['"]|['"]$/g, '').trim();
+}
+
+function normalizePhpClassName(className: string): string {
+  return className.replace(/^\\+/, '').trim();
+}
+
+function getPhpClassBaseName(className: string): string {
+  const normalized = normalizePhpClassName(className);
+  return normalized.split('\\').pop() ?? normalized;
+}
+
+function relationshipModelName(className: string): string {
+  return getPhpClassBaseName(className);
+}
+
+function parsePhpUseAliases(content: string): Map<string, string> {
+  const aliases = new Map<string, string>();
+  const useRegex = /^\s*use\s+([^;]+);/gm;
+  let useMatch: RegExpExecArray | null;
+
+  while ((useMatch = useRegex.exec(content)) !== null) {
+    const imported = useMatch[1].trim();
+    if (imported.includes('{') || imported.includes(',')) {
+      continue;
+    }
+
+    const aliasMatch = imported.match(/\s+as\s+(\w+)$/i);
+    const classPath = normalizePhpClassName(imported.replace(/\s+as\s+\w+$/i, ''));
+    const alias = aliasMatch ? aliasMatch[1] : getPhpClassBaseName(classPath);
+    aliases.set(alias, classPath);
+  }
+
+  return aliases;
+}
+
+function extendsEloquentModel(content: string, extendedClass: string): boolean {
+  const normalized = normalizePhpClassName(extendedClass);
+  if (ELOQUENT_BASE_CLASS_PATHS.has(normalized)) {
+    return true;
+  }
+
+  const baseName = getPhpClassBaseName(normalized);
+  if (ELOQUENT_BASE_CLASS_NAMES.has(baseName)) {
+    return true;
+  }
+
+  const importedClass = parsePhpUseAliases(content).get(baseName);
+  return importedClass ? ELOQUENT_BASE_CLASS_PATHS.has(importedClass) : false;
 }
 
 // Parse column modifiers from a chain like ->nullable()->default('x')->unique()
@@ -34,38 +136,92 @@ function parseModifiers(chain: string): { nullable: boolean; unique: boolean; de
   };
 }
 
-// Recursively collect all .php files from a directory
-function collectPhpFiles(dir: string): string[] {
-  const results: string[] = [];
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    const fullPath = path.join(dir, entry.name);
-    if (entry.isDirectory()) {
-      results.push(...collectPhpFiles(fullPath));
-    } else if (entry.name.endsWith('.php')) {
-      results.push(fullPath);
-    }
+async function pathExists(filePath: string): Promise<boolean> {
+  try {
+    await fsp.stat(filePath);
+    return true;
+  } catch {
+    return false;
   }
-  return results;
 }
 
-export function parseMigration(content: string, filePath: string): Entity | null {
-  // Find Schema::create / Schema::table
-  const createMatch = content.match(/Schema::create\s*\(\s*['"]([^'"]+)['"]/);
-  if (!createMatch) return null;
+// Recursively collect all .php files from a directory. Uses the Dirent
+// metadata returned by `withFileTypes: true` to avoid an extra stat per
+// entry, and recurses into subdirectories in parallel.
+async function collectPhpFiles(dir: string): Promise<string[]> {
+  let entries: import('fs').Dirent[];
+  try {
+    entries = await fsp.readdir(dir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
 
-  const tableName = createMatch[1];
+  const directFiles: string[] = [];
+  const subdirPromises: Promise<string[]>[] = [];
+
+  for (const entry of entries) {
+    const fullPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      subdirPromises.push(collectPhpFiles(fullPath));
+    } else if (entry.isFile() && entry.name.endsWith('.php')) {
+      directFiles.push(fullPath);
+    }
+  }
+
+  const nested = await Promise.all(subdirPromises);
+  for (const list of nested) {
+    directFiles.push(...list);
+  }
+  return directFiles;
+}
+
+function joinMultilineChains(content: string): string[] {
+  const statements: string[] = [];
+  let currentStatement = '';
+
+  for (const rawLine of content.split('\n')) {
+    const trimmedLine = rawLine.trim();
+    if (!trimmedLine) {
+      continue;
+    }
+
+    if (trimmedLine.startsWith('$table->')) {
+      currentStatement = trimmedLine;
+    } else if (currentStatement && trimmedLine.startsWith('->')) {
+      currentStatement += trimmedLine;
+    } else {
+      continue;
+    }
+
+    if (currentStatement.endsWith(';')) {
+      statements.push(currentStatement);
+      currentStatement = '';
+    }
+  }
+
+  if (currentStatement) {
+    statements.push(currentStatement);
+  }
+
+  return statements;
+}
+
+function parseMigrationBlock(content: string, filePath: string): Entity | null {
+  // Find Schema::create / Schema::table
+  const tableMatch = content.match(/Schema::(?:create|table)\s*\(\s*['"]([^'"]+)['"]/);
+  if (!tableMatch) return null;
+
+  const tableName = tableMatch[1];
 
   // Derive a display name from table name
   const nameParts = tableName.split('_');
   const name = nameParts.map(p => p.charAt(0).toUpperCase() + p.slice(1)).join('');
 
   const columns: Column[] = [];
+  const pendingForeignKeys: PendingForeignKey[] = [];
 
-  // Match each $table->... line (greedy to end of statement)
-  const lines = content.split('\n');
-  for (const rawLine of lines) {
-    const line = rawLine.trim();
-    if (!line.startsWith('$table->')) continue;
+  // Match each $table->... statement, including multiline modifier chains.
+  for (const line of joinMultilineChains(content)) {
 
     // id() shorthand
     if (/\$table->id\(\)/.test(line)) {
@@ -111,10 +267,6 @@ export function parseMigration(content: string, filePath: string): Entity | null
           const base = colName.replace(/_id$/, '');
           fkTable = classToTable(base.charAt(0).toUpperCase() + base.slice(1));
         }
-      } else {
-        // Just foreignId without constrained - still infer FK target
-        const base = colName.replace(/_id$/, '');
-        fkTable = classToTable(base.charAt(0).toUpperCase() + base.slice(1));
       }
 
       columns.push({
@@ -140,6 +292,10 @@ export function parseMigration(content: string, filePath: string): Entity | null
       const existingCol = columns.find(c => c.name === colName);
       if (existingCol) {
         existingCol.foreignKey = { table: refTable, column: refCol };
+      } else {
+        // The column was declared in an earlier migration; remember the FK so
+        // parseProject can apply it after merging all migrations.
+        pendingForeignKeys.push({ column: colName, references: { table: refTable, column: refCol } });
       }
       continue;
     }
@@ -212,16 +368,39 @@ export function parseMigration(content: string, filePath: string): Entity | null
     guarded: [],
     relationships: [],
     migrationFile: filePath,
+    pendingForeignKeys: pendingForeignKeys.length > 0 ? pendingForeignKeys : undefined,
   };
 }
 
+export function parseMigrations(content: string, filePath: string): Entity[] {
+  const schemaBlockRegex = /Schema::(?:create|table)\s*\(\s*['"][^'"]+['"][\s\S]*?\}\s*\)\s*;/g;
+  const blocks = Array.from(content.matchAll(schemaBlockRegex), match => match[0]);
+  const candidates = blocks.length > 0 ? blocks : [content];
+  const entities: Entity[] = [];
+
+  for (const candidate of candidates) {
+    const parsed = parseMigrationBlock(candidate, filePath);
+    if (parsed) {
+      entities.push(parsed);
+    }
+  }
+
+  return entities;
+}
+
+export function parseMigration(content: string, filePath: string): Entity | null {
+  return parseMigrations(content, filePath)[0] ?? null;
+}
+
 export function parseModel(content: string, filePath: string): Partial<Entity> | null {
-  // Must extend Model / Authenticatable / etc.
-  const classMatch = content.match(/class\s+(\w+)\s+extends\s+\w+/);
+  const classMatch = content.match(/class\s+(\w+)\s+extends\s+(\\?[\w\\]+)/);
   if (!classMatch) return null;
 
   // Skip migrations themselves
   if (/extends\s+Migration/.test(content)) return null;
+
+  const extendedClass = classMatch[2];
+  if (!extendsEloquentModel(content, extendedClass)) return null;
 
   const name = classMatch[1];
 
@@ -259,16 +438,20 @@ export function parseModel(content: string, filePath: string): Partial<Entity> |
     'morphMany', 'morphTo', 'hasOneThrough', 'hasManyThrough',
   ];
 
-  // Match public functions returning relationships
-  const methodRegex = /public\s+function\s+(\w+)\s*\([^)]*\)[^{]*\{[^}]*return\s+\$this->(\w+)\s*\(\s*(\w+)::class/g;
+  const methodRegex = /public\s+function\s+(\w+)\s*\([^)]*\)[^{]*\{[^}]*return\s+\$this->(\w+)\s*\(\s*(\\?[\w\\]+)::class/g;
   let m: RegExpExecArray | null;
   while ((m = methodRegex.exec(content)) !== null) {
     const methodName = m[1];
     const relType = m[2] as RelationshipType;
-    const relatedModel = m[3];
+    const relatedModel = relationshipModelName(m[3]);
     if (relTypes.includes(relType)) {
       relationships.push({ name: methodName, type: relType, relatedModel });
     }
+  }
+
+  const morphToRegex = /public\s+function\s+(\w+)\s*\([^)]*\)[^{]*\{[^}]*return\s+\$this->morphTo\s*\(/g;
+  while ((m = morphToRegex.exec(content)) !== null) {
+    relationships.push({ name: m[1], type: 'morphTo', relatedModel: m[1] });
   }
 
   return { name, tableName, fillable, guarded, relationships, modelFile: filePath };
@@ -279,31 +462,63 @@ export async function parseProject(workspacePath: string): Promise<Schema> {
 
   // Parse migrations
   const migrationsDir = path.join(workspacePath, 'database', 'migrations');
-  if (fs.existsSync(migrationsDir)) {
-    const files = fs.readdirSync(migrationsDir)
-      .filter(f => f.endsWith('.php'))
+  if (await pathExists(migrationsDir)) {
+    const files = (await fsp.readdir(migrationsDir))
+      .filter(fileName => fileName.endsWith('.php'))
       .sort(); // chronological order
-    for (const file of files) {
-      try {
-        const content = fs.readFileSync(path.join(migrationsDir, file), 'utf8');
-        const parsed = parseMigration(content, path.join(migrationsDir, file));
-        if (parsed) {
-          // Merge with existing entity (Schema::table alters)
-          const existing = entities.find(e => e.tableName === parsed.tableName);
-          if (existing) {
-            // Add new columns from alter migrations
-            for (const col of parsed.columns) {
-              if (!existing.columns.find(c => c.name === col.name)) {
-                existing.columns.push(col);
-              }
-            }
-          } else {
-            entities.push(parsed);
-          }
+
+    // Read files in parallel, but preserve chronological merge order below.
+    const fileContents = await Promise.all(
+      files.map(async file => {
+        const fullPath = path.join(migrationsDir, file);
+        try {
+          return { fullPath, content: await fsp.readFile(fullPath, 'utf8') };
+        } catch {
+          return { fullPath, content: null as string | null };
         }
+      })
+    );
+
+    for (const { fullPath, content } of fileContents) {
+      if (content === null) continue;
+      let parsedEntities: Entity[];
+      try {
+        parsedEntities = parseMigrations(content, fullPath);
       } catch {
-        // Skip unparseable files
+        continue;
       }
+      for (const parsed of parsedEntities) {
+        // Merge with existing entity (Schema::table alters)
+        const existing = entities.find(e => e.tableName === parsed.tableName);
+        if (existing) {
+          for (const col of parsed.columns) {
+            if (!existing.columns.find(c => c.name === col.name)) {
+              existing.columns.push(col);
+            }
+          }
+          if (parsed.pendingForeignKeys) {
+            existing.pendingForeignKeys = [
+              ...(existing.pendingForeignKeys ?? []),
+              ...parsed.pendingForeignKeys,
+            ];
+          }
+        } else {
+          entities.push(parsed);
+        }
+      }
+    }
+
+    // Apply any pending FK declarations (from alter migrations whose column
+    // was defined in another file) to their referenced columns.
+    for (const entity of entities) {
+      if (!entity.pendingForeignKeys) continue;
+      for (const pending of entity.pendingForeignKeys) {
+        const target = entity.columns.find(c => c.name === pending.column);
+        if (target && !target.foreignKey) {
+          target.foreignKey = { ...pending.references };
+        }
+      }
+      delete entity.pendingForeignKeys;
     }
   }
 
@@ -313,23 +528,57 @@ export async function parseProject(workspacePath: string): Promise<Schema> {
     path.join(workspacePath, 'app'),
   ];
 
+  const seenFiles = new Set<string>();
+  const modelFiles: string[] = [];
+
   for (const modelDir of modelDirs) {
-    if (!fs.existsSync(modelDir)) continue;
-    const files = collectPhpFiles(modelDir);
+    if (!await pathExists(modelDir)) continue;
+    const files = await collectPhpFiles(modelDir);
     for (const filePath of files) {
+      const resolvedFilePath = path.resolve(filePath);
+      if (seenFiles.has(resolvedFilePath)) continue;
+      seenFiles.add(resolvedFilePath);
+      modelFiles.push(filePath);
+    }
+  }
+
+  const modelFileContents = await Promise.all(
+    modelFiles.map(async filePath => {
       try {
-        const content = fs.readFileSync(filePath, 'utf8');
+        return { filePath, content: await fsp.readFile(filePath, 'utf8') };
+      } catch {
+        return { filePath, content: null as string | null };
+      }
+    })
+  );
+
+  const entityByName = new Map<string, Entity>();
+  const entityByTableName = new Map<string, Entity>();
+  const rememberEntity = (entity: Entity): void => {
+    entityByName.set(entity.name, entity);
+    entityByTableName.set(entity.tableName, entity);
+  };
+
+  for (const entity of entities) {
+    rememberEntity(entity);
+  }
+
+  for (const { filePath, content } of modelFileContents) {
+    if (content === null) continue;
+      try {
         const modelData = parseModel(content, filePath);
         if (!modelData || !modelData.name) continue;
 
-        const existing = entities.find(e => e.name === modelData.name || e.tableName === modelData.tableName);
+        const existing = entityByName.get(modelData.name) ?? (
+          modelData.tableName ? entityByTableName.get(modelData.tableName) : undefined
+        );
         if (existing) {
           existing.fillable = modelData.fillable ?? [];
           existing.guarded = modelData.guarded ?? [];
           existing.relationships = modelData.relationships ?? [];
           existing.modelFile = modelData.modelFile;
         } else {
-          entities.push({
+          const entity = {
             name: modelData.name,
             tableName: modelData.tableName ?? classToTable(modelData.name),
             columns: [],
@@ -337,13 +586,13 @@ export async function parseProject(workspacePath: string): Promise<Schema> {
             guarded: modelData.guarded ?? [],
             relationships: modelData.relationships ?? [],
             modelFile: modelData.modelFile,
-          });
+          };
+          entities.push(entity);
+          rememberEntity(entity);
         }
       } catch {
         // Skip
       }
-    }
-    break; // Use first found models dir
   }
 
   return { entities };

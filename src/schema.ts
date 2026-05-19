@@ -41,6 +41,18 @@ export interface Entity {
   relationships: Relationship[];
   migrationFile?: string;
   modelFile?: string;
+  /**
+   * Foreign keys declared via `$table->foreign(...)->references(...)->on(...)`
+   * for which the column was not present in the same migration file.
+   * `parseProject` applies these to existing columns after all migrations
+   * have been parsed.
+   */
+  pendingForeignKeys?: PendingForeignKey[];
+}
+
+export interface PendingForeignKey {
+  column: string;
+  references: ForeignKey;
 }
 
 export interface Schema {

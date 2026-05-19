@@ -4,10 +4,15 @@ import * as path from 'path';
 export type WorkspaceFolderLike = { uri: { fsPath: string } };
 
 function isPathInside(childPath: string, parentPath: string): boolean {
-  const childResolved = path.resolve(childPath);
-  const parentResolved = path.resolve(parentPath);
+  const childResolved = normalizePathForComparison(childPath);
+  const parentResolved = normalizePathForComparison(parentPath);
 
   return childResolved === parentResolved || childResolved.startsWith(parentResolved + path.sep);
+}
+
+function normalizePathForComparison(filePath: string): string {
+  const resolvedPath = path.resolve(filePath);
+  return process.platform === 'win32' ? resolvedPath.toLowerCase() : resolvedPath;
 }
 
 export function isLaravelProjectPath(workspaceRoot: string): boolean {
@@ -35,9 +40,13 @@ export function resolveWorkspaceRoot(
   }
 
   if (activeFilePath) {
-    const activeFolder = folderPaths.find(folderPath => isPathInside(activeFilePath, folderPath));
-    if (activeFolder && isLaravelProjectPath(activeFolder)) {
-      return activeFolder;
+    const activeLaravelFolders = folderPaths
+      .filter(folderPath => isPathInside(activeFilePath, folderPath))
+      .filter(isLaravelProjectPath)
+      .sort((left, right) => path.resolve(right).length - path.resolve(left).length);
+
+    if (activeLaravelFolders.length > 0) {
+      return activeLaravelFolders[0];
     }
   }
 

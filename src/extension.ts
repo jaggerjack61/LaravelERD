@@ -3,6 +3,7 @@ import { ErdPanel } from './erdPanel';
 import { getLaravelWorkspaceRoots, isLaravelProjectPath, resolveWorkspaceRoot } from './workspaceRoot';
 
 let watchers: vscode.FileSystemWatcher[] = [];
+let debounceTimer: ReturnType<typeof setTimeout> | undefined;
 
 export function activate(context: vscode.ExtensionContext): void {
   const workspaceFolders = vscode.workspace.workspaceFolders;
@@ -43,11 +44,21 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   // FileSystemWatcher for migrations and models
+  const onChanged = () => {
+    if (debounceTimer) {
+      clearTimeout(debounceTimer);
+    }
+
+    debounceTimer = setTimeout(() => {
+      debounceTimer = undefined;
+      ErdPanel.refresh();
+    }, 250);
+  };
+
   for (const workspaceRoot of laravelWorkspaceRoots) {
     const watcher = vscode.workspace.createFileSystemWatcher(
-      new vscode.RelativePattern(workspaceRoot, '{database/migrations/*.php,app/Models/**/*.php,app/*.php}')
+      new vscode.RelativePattern(workspaceRoot, '{database/migrations/*.php,app/**/*.php}')
     );
-    const onChanged = () => ErdPanel.refresh();
     watcher.onDidChange(onChanged);
     watcher.onDidCreate(onChanged);
     watcher.onDidDelete(onChanged);
@@ -63,6 +74,10 @@ export function activate(context: vscode.ExtensionContext): void {
 }
 
 export function deactivate(): void {
+  if (debounceTimer) {
+    clearTimeout(debounceTimer);
+    debounceTimer = undefined;
+  }
   watchers.forEach(watcher => watcher.dispose());
   watchers = [];
 }

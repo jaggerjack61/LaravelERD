@@ -1,14 +1,68 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
+import * as fsp from 'fs/promises';
 import * as path from 'path';
+import * as crypto from 'crypto';
 import { parseProject } from './parser';
 import { Schema, Entity, Column } from './schema';
+import { createUniqueMigrationPath, insertBeforeFinalClassBrace } from './erdPanelHelpers';
+
+const BLUEPRINT_TYPE_MAP: Record<string, string> = {
+  'varchar': 'string',
+  'varchar(45)': 'ipAddress',
+  'varchar(17)': 'macAddress',
+  'int': 'integer',
+  'int unsigned': 'unsignedInteger',
+  'bigint': 'bigInteger',
+  'bigint unsigned': 'unsignedBigInteger',
+  'smallint': 'smallInteger',
+  'tinyint': 'tinyInteger',
+  'text': 'text',
+  'longtext': 'longText',
+  'mediumtext': 'mediumText',
+  'boolean': 'boolean',
+  'float': 'float',
+  'double': 'double',
+  'decimal': 'decimal',
+  'date': 'date',
+  'datetime': 'dateTime',
+  'timestamp': 'timestamp',
+  'time': 'time',
+  'year': 'year',
+  'json': 'json',
+  'jsonb': 'jsonb',
+  'uuid': 'uuid',
+  'ulid': 'ulid',
+  'enum': 'enum',
+  'char': 'char',
+  'binary': 'binary',
+};
+
+function isDarkTheme(): boolean {
+  const kind = vscode.window.activeColorTheme.kind;
+  return kind !== vscode.ColorThemeKind.Light && kind !== vscode.ColorThemeKind.HighContrastLight;
+}
+
+function isPathInsideWorkspace(candidatePath: string, workspacePath: string): boolean {
+  const workspaceResolved = path.resolve(workspacePath);
+  // Issue: relative candidate paths were resolved against process.cwd(); resolve against workspace instead.
+  const resolved = path.isAbsolute(candidatePath)
+    ? path.resolve(candidatePath)
+    : path.resolve(workspaceResolved, candidatePath);
+  return resolved === workspaceResolved || resolved.startsWith(workspaceResolved + path.sep);
+}
+
+function toBlueprintMethod(type: string): string {
+  return BLUEPRINT_TYPE_MAP[type] ?? type;
+}
+
+function escapePhpString(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+}
 
 function getNonce(): string {
-  let text = '';
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-  for (let i = 0; i < 32; i++) text += chars[Math.floor(Math.random() * chars.length)];
-  return text;
+  // Use a CSPRNG so the CSP nonce can't be predicted from earlier values.
+  return crypto.randomBytes(24).toString('base64').replace(/[+/=]/g, '');
 }
 
 export class ErdPanel {
@@ -22,8 +76,11 @@ export class ErdPanel {
   public static createOrShow(extensionUri: vscode.Uri, workspacePath: string): void {
     const column = vscode.window.activeTextEditor?.viewColumn ?? vscode.ViewColumn.One;
     if (ErdPanel.currentPanel) {
-      ErdPanel.currentPanel.panel.reveal(column);
-      return;
+      if (path.resolve(ErdPanel.currentPanel.workspacePath) === path.resolve(workspacePath)) {
+        ErdPanel.currentPanel.panel.reveal(column);
+        return;
+      }
+      ErdPanel.currentPanel.panel.dispose();
     }
     const panel = vscode.window.createWebviewPanel(
       'laravelErd',
@@ -67,8 +124,13 @@ export class ErdPanel {
             await this.exportSvg(message.content as string);
             break;
           case 'openFile':
-            if (message.path && fs.existsSync(message.path)) {
-              vscode.window.showTextDocument(vscode.Uri.file(message.path));
+            if (typeof message.path === 'string' && isPathInsideWorkspace(message.path, this.workspacePath)) {
+              const resolvedPath = path.isAbsolute(message.path)
+                ? path.resolve(message.path)
+                : path.resolve(this.workspacePath, message.path);
+              if (fs.existsSync(resolvedPath)) {
+                vscode.window.showTextDocument(vscode.Uri.file(resolvedPath));
+              }
             }
             break;
         }
@@ -79,19 +141,17 @@ export class ErdPanel {
 
     // Theme change listener
     vscode.window.onDidChangeActiveColorTheme(() => {
-      const isDark = vscode.window.activeColorTheme.kind !== vscode.ColorThemeKind.Light;
-      this.panel.webview.postMessage({ type: 'theme', isDark });
+      this.panel.webview.postMessage({ type: 'theme', isDark: isDarkTheme() });
     }, null, this.disposables);
   }
 
   private async doRefresh(): Promise<void> {
-    vscode.window.withProgress(
+    return vscode.window.withProgress(
       { location: vscode.ProgressLocation.Window, title: 'Laravel ERD: Parsing project…' },
       async () => {
         try {
           this.schema = await parseProject(this.workspacePath);
-          const isDark = vscode.window.activeColorTheme.kind !== vscode.ColorThemeKind.Light;
-          this.panel.webview.postMessage({ type: 'schema', data: this.schema, isDark });
+          this.panel.webview.postMessage({ type: 'schema', data: this.schema, isDark: isDarkTheme() });
         } catch (err) {
           vscode.window.showErrorMessage(`Laravel ERD parse error: ${String(err)}`);
         }
@@ -106,7 +166,7 @@ export class ErdPanel {
     for (const newEntity of newSchema.entities) {
       try {
         if (newEntity.modelFile && fs.existsSync(newEntity.modelFile)) {
-          const updated = this.updateModelFile(newEntity.modelFile, newEntity);
+          const updated = await this.updateModelFile(newEntity.modelFile, newEntity);
           if (updated) savedFiles++;
         }
       } catch (err) {
@@ -117,7 +177,7 @@ export class ErdPanel {
     // Check for new columns vs original schema and suggest migration
     const newColumns = this.collectNewColumns(newSchema);
     if (newColumns.length > 0) {
-      const migPath = this.generateAlterMigration(newColumns);
+      const migPath = await this.generateAlterMigration(newColumns);
       if (migPath) {
         savedFiles++;
         vscode.window.showInformationMessage(
@@ -152,35 +212,49 @@ export class ErdPanel {
     this.schema = newSchema;
   }
 
-  private updateModelFile(filePath: string, entity: Entity): boolean {
-    let content = fs.readFileSync(filePath, 'utf8');
+  private async updateModelFile(filePath: string, entity: Entity): Promise<boolean> {
+    let content = await fsp.readFile(filePath, 'utf8');
     let changed = false;
 
     // Update $fillable (even if now empty)
     {
-      const fillableStr = entity.fillable.map(f => `'${f}'`).join(', ');
+      const fillableStr = entity.fillable.map(field => `'${escapePhpString(field)}'`).join(', ');
       const newFillable = `protected $fillable = [${fillableStr}]`;
-      const replaced = content.replace(
-        /protected\s+\$fillable\s*=\s*\[[^\]]*\]/s,
-        newFillable
-      );
-      if (replaced !== content) {
-        content = replaced;
-        changed = true;
+      const fillableRegex = /protected\s+\$fillable\s*=\s*\[[^\]]*\]/s;
+      if (fillableRegex.test(content)) {
+        const replaced = content.replace(fillableRegex, newFillable);
+        if (replaced !== content) {
+          content = replaced;
+          changed = true;
+        }
+      } else if (entity.fillable.length > 0) {
+        // Issue #23: Insert $fillable if model lacks the property.
+        const inserted = this.insertModelProperty(content, newFillable);
+        if (inserted !== content) {
+          content = inserted;
+          changed = true;
+        }
       }
     }
 
     // Update $guarded (even if now empty)
     {
-      const guardedStr = entity.guarded.map(f => `'${f}'`).join(', ');
+      const guardedStr = entity.guarded.map(field => `'${escapePhpString(field)}'`).join(', ');
       const newGuarded = `protected $guarded = [${guardedStr}]`;
-      const replaced = content.replace(
-        /protected\s+\$guarded\s*=\s*\[[^\]]*\]/s,
-        newGuarded
-      );
-      if (replaced !== content) {
-        content = replaced;
-        changed = true;
+      const guardedRegex = /protected\s+\$guarded\s*=\s*\[[^\]]*\]/s;
+      if (guardedRegex.test(content)) {
+        const replaced = content.replace(guardedRegex, newGuarded);
+        if (replaced !== content) {
+          content = replaced;
+          changed = true;
+        }
+      } else if (entity.guarded.length > 0) {
+        // Issue #23: Insert $guarded if model lacks the property.
+        const inserted = this.insertModelProperty(content, newGuarded);
+        if (inserted !== content) {
+          content = inserted;
+          changed = true;
+        }
       }
     }
 
@@ -200,14 +274,21 @@ export class ErdPanel {
       }).join('\n\n');
 
       // Insert before the closing brace of the class
-      content = content.replace(/(\n\}[\s\n]*$)/, `\n\n${methods}\n$1`);
-      changed = true;
+      const inserted = insertBeforeFinalClassBrace(content, methods);
+      if (inserted && inserted !== content) {
+        content = inserted;
+        changed = true;
+      }
     }
 
     if (changed) {
-      fs.writeFileSync(filePath, content, 'utf8');
+      await fsp.writeFile(filePath, content, 'utf8');
     }
     return changed;
+  }
+
+  private insertModelProperty(content: string, property: string): string {
+    return insertBeforeFinalClassBrace(content, `    ${property};`) ?? content;
   }
 
   private collectNewColumns(newSchema: Schema): Array<{ entity: Entity; columns: Column[] }> {
@@ -224,33 +305,32 @@ export class ErdPanel {
     return result;
   }
 
-  private generateAlterMigration(changes: Array<{ entity: Entity; columns: Column[] }>): string | null {
+  private async generateAlterMigration(changes: Array<{ entity: Entity; columns: Column[] }>): Promise<string | null> {
     const migrationsDir = path.join(this.workspacePath, 'database', 'migrations');
     if (!fs.existsSync(migrationsDir)) return null;
 
     const ts = new Date().toISOString().replace(/[-:T.Z]/g, '').slice(0, 14);
-    const filename = `${ts}_alter_tables_add_columns.php`;
-    const filePath = path.join(migrationsDir, filename);
+    const filePath = await createUniqueMigrationPath(migrationsDir, ts);
 
     const upBlocks = changes.map(({ entity, columns }) => {
       const colLines = columns.map(col => {
-        let line = `            $table->${col.type}('${col.name}')`;
+        let line = `            $table->${toBlueprintMethod(col.type)}('${escapePhpString(col.name)}')`;
         if (col.nullable) line += `->nullable()`;
-        if (col.default !== undefined) line += `->default('${col.default}')`;
+        if (col.default !== undefined) line += `->default('${escapePhpString(col.default)}')`;
         if (col.unique) line += `->unique()`;
         return line + ';';
       }).join('\n');
       return [
-        `        Schema::table('${entity.tableName}', function (\\Illuminate\\Database\\Schema\\Blueprint $table) {`,
+        `        Schema::table('${escapePhpString(entity.tableName)}', function (\\Illuminate\\Database\\Schema\\Blueprint $table) {`,
         colLines,
         `        });`,
       ].join('\n');
     }).join('\n\n');
 
     const downBlocks = changes.map(({ entity, columns }) => {
-      const drops = columns.map(col => `            $table->dropColumn('${col.name}');`).join('\n');
+      const drops = columns.map(col => `            $table->dropColumn('${escapePhpString(col.name)}');`).join('\n');
       return [
-        `        Schema::table('${entity.tableName}', function (\\Illuminate\\Database\\Schema\\Blueprint $table) {`,
+        `        Schema::table('${escapePhpString(entity.tableName)}', function (\\Illuminate\\Database\\Schema\\Blueprint $table) {`,
         drops,
         `        });`,
       ].join('\n');
@@ -275,7 +355,7 @@ ${downBlocks}
     }
 };
 `;
-    fs.writeFileSync(filePath, content, 'utf8');
+    await fsp.writeFile(filePath, content, 'utf8');
     return filePath;
   }
 
@@ -285,15 +365,16 @@ ${downBlocks}
       filters: { 'SVG Image': ['svg'] },
     });
     if (uri) {
-      fs.writeFileSync(uri.fsPath, content, 'utf8');
+      await fsp.writeFile(uri.fsPath, content, 'utf8');
       vscode.window.showInformationMessage(`ERD exported to ${uri.fsPath}`);
     }
   }
 
   private dispose(): void {
     ErdPanel.currentPanel = undefined;
-    this.panel.dispose();
-    this.disposables.forEach(d => d.dispose());
+    while (this.disposables.length > 0) {
+      this.disposables.pop()?.dispose();
+    }
   }
 
   private getHtml(webview: vscode.Webview): string {
@@ -656,6 +737,9 @@ let zoom = 1;
 let panX = 0, panY = 0;
 let drag = null;             // { type:'card'|'pan', entityName?, startX, startY, origX, origY, origPanX, origPanY }
 let relFilter = 'both';      // 'both' | 'fk' | 'eloquent'
+let renderRelsFrame = null;
+let dragCleanup = null;
+let didAutoFit = false;
 
 // ─────────────────────────────────────────────────
 // MESSAGE HANDLING
@@ -663,16 +747,43 @@ let relFilter = 'both';      // 'both' | 'fk' | 'eloquent'
 window.addEventListener('message', ev => {
   const msg = ev.data;
   if (msg.type === 'schema') {
-    schema = msg.data;
+    const nextSchema = msg.data;
+    migratePositionsForSchema(nextSchema);
+    schema = nextSchema;
     if (msg.isDark === false) document.body.classList.add('light');
     else document.body.classList.remove('light');
     autoLayout();
     render();
+    // Issue #24: Call fitToScreen after schema is loaded.
+    if (!didAutoFit && schema.entities.length) {
+      fitToScreen();
+      didAutoFit = true;
+    }
   } else if (msg.type === 'theme') {
     if (msg.isDark === false) document.body.classList.add('light');
     else document.body.classList.remove('light');
   }
 });
+
+function migratePositionsForSchema(nextSchema) {
+  // Issue #19: Migrate positions when entity names change.
+  const currentByTable = new Map(schema.entities.map(entity => [entity.tableName, entity.name]));
+  const nextPositions = {};
+
+  nextSchema.entities.forEach(entity => {
+    if (positions[entity.name]) {
+      nextPositions[entity.name] = positions[entity.name];
+      return;
+    }
+
+    const previousName = currentByTable.get(entity.tableName);
+    if (previousName && positions[previousName]) {
+      nextPositions[entity.name] = positions[previousName];
+    }
+  });
+
+  positions = nextPositions;
+}
 
 window.addEventListener('load', () => vscode.postMessage({ type: 'ready' }));
 
@@ -735,12 +846,43 @@ function render() {
 function renderCards() {
   const canvas = document.getElementById('canvas');
   const svg = document.getElementById('rel-svg');
-  Array.from(canvas.children).forEach(c => { if (c !== svg) c.remove(); });
+  const existingCards = new Map(
+    Array.from(canvas.querySelectorAll('.entity-card')).map(card => [card.dataset.entity, card])
+  );
+  const activeEntityNames = new Set(schema.entities.map(entity => entity.name));
+
+  existingCards.forEach((card, entityName) => {
+    if (!activeEntityNames.has(entityName)) {
+      card.remove();
+    }
+  });
 
   schema.entities.forEach(entity => {
     const pos = positions[entity.name] || { x: 0, y: 0 };
-    const card = buildCard(entity, pos);
-    canvas.insertBefore(card, svg);
+    const signature = cardSignature(entity);
+    const existingCard = existingCards.get(entity.name);
+
+    if (existingCard && existingCard.dataset.signature === signature) {
+      existingCard.style.left = pos.x + 'px';
+      existingCard.style.top = pos.y + 'px';
+      return;
+    }
+
+    const newCard = buildCard(entity, pos);
+    newCard.dataset.signature = signature;
+    if (existingCard) {
+      canvas.replaceChild(newCard, existingCard);
+    } else {
+      canvas.insertBefore(newCard, svg);
+    }
+  });
+}
+
+function cardSignature(entity) {
+  return JSON.stringify({
+    entity,
+    tab: activeTabs[entity.name] || 'migration',
+    editing: editingCol && editingCol.entityName === entity.name ? editingCol : null,
   });
 }
 
@@ -856,8 +998,18 @@ function buildEditRow(entity, col, idx) {
   wrap.appendChild(typeSelect);
 
   const optRow = el('div', 'edit-row-row');
-  const nullLbl = el('label'); nullLbl.innerHTML = '<input type="checkbox"> nullable'; nullLbl.querySelector('input').checked = col.nullable;
-  const uniqLbl = el('label'); uniqLbl.innerHTML = '<input type="checkbox"> unique'; uniqLbl.querySelector('input').checked = col.unique;
+  const nullLbl = el('label');
+  const nullCb = document.createElement('input');
+  nullCb.type = 'checkbox';
+  nullCb.checked = col.nullable;
+  nullLbl.appendChild(nullCb);
+  nullLbl.appendChild(document.createTextNode(' nullable'));
+  const uniqLbl = el('label');
+  const uniqCb = document.createElement('input');
+  uniqCb.type = 'checkbox';
+  uniqCb.checked = col.unique;
+  uniqLbl.appendChild(uniqCb);
+  uniqLbl.appendChild(document.createTextNode(' unique'));
   optRow.appendChild(nullLbl); optRow.appendChild(uniqLbl);
   wrap.appendChild(optRow);
 
@@ -868,8 +1020,8 @@ function buildEditRow(entity, col, idx) {
     if (e && e.columns[idx]) {
       e.columns[idx].name = nameIn.value.trim() || col.name;
       e.columns[idx].type = typeSelect.value;
-      e.columns[idx].nullable = nullLbl.querySelector('input').checked;
-      e.columns[idx].unique = uniqLbl.querySelector('input').checked;
+      e.columns[idx].nullable = nullCb.checked;
+      e.columns[idx].unique = uniqCb.checked;
     }
     editingCol = null; render();
   });
@@ -961,18 +1113,21 @@ function estimateCardHeight(entityName) {
   return HDR_H_R + TABS_H_R + COL_PAD_R + maxCols * COL_H_R + 32;
 }
 
-// Obstacle rectangles for all entities except the two being connected
-function getObstacles(excludeA, excludeB) {
+function computeAllObstacles() {
   const P = 18;
   return schema.entities
-    .filter(e => e.name !== excludeA && e.name !== excludeB)
     .map(e => {
       const p = positions[e.name];
       if (!p) return null;
       const h = estimateCardHeight(e.name);
-      return { x: p.x - P, y: p.y - P, r: p.x + CARD_W_R + P, b: p.y + h + P };
+      return { name: e.name, x: p.x - P, y: p.y - P, r: p.x + CARD_W_R + P, b: p.y + h + P };
     })
     .filter(Boolean);
+}
+
+// Obstacle rectangles for all entities except the two being connected
+function getObstacles(excludeA, excludeB, cachedObstacles) {
+  return cachedObstacles.filter(obstacle => obstacle.name !== excludeA && obstacle.name !== excludeB);
 }
 
 function vertHitsObs(x, y1, y2, obs) {
@@ -1069,7 +1224,7 @@ function drawCardinality(parent, x, y, signDir, type, color) {
   }
 }
 
-function drawRelEdge(svg, srcName, tgtName, srcCard, tgtCard, color, dashed, relType, relKind) {
+function drawRelEdge(svg, srcName, tgtName, srcCard, tgtCard, color, dashed, relType, relKind, cachedObstacles) {
   const fp = positions[srcName], tp = positions[tgtName];
   if (!fp || !tp) return;
 
@@ -1088,7 +1243,7 @@ function drawRelEdge(svg, srcName, tgtName, srcCard, tgtCard, color, dashed, rel
     srcDir = -1; tgtDir = 1;
   }
 
-  const obs = getObstacles(srcName, tgtName);
+  const obs = getObstacles(srcName, tgtName, cachedObstacles);
   const pts = routeOrtho(sx, sy, ex, ey, obs);
   const d = orthoPathD(pts, 8);
 
@@ -1136,6 +1291,18 @@ function renderRels() {
 
   const FK_COLOR  = '#4a9edd'; // VS Code blue — FK constraints
   const REL_COLOR = '#4ec9b0'; // VS Code teal — Eloquent relationships
+  const cachedObstacles = computeAllObstacles();
+
+  // Perf: build lookup maps once per render so target resolution for FKs and
+  // Eloquent relationships is O(1) instead of O(N) per edge.
+  const entityByTableName = new Map();
+  const entityByName = new Map();
+  const entityByLowerName = new Map();
+  schema.entities.forEach(entity => {
+    entityByTableName.set(entity.tableName, entity);
+    entityByName.set(entity.name, entity);
+    entityByLowerName.set(entity.name.toLowerCase(), entity);
+  });
 
   schema.entities.forEach(entity => {
     const fp = positions[entity.name];
@@ -1145,9 +1312,8 @@ function renderRels() {
     if (relFilter === 'both' || relFilter === 'fk') {
       entity.columns.forEach(col => {
         if (!col.foreignKey) return;
-        const tgt = schema.entities.find(e =>
-          e.tableName === col.foreignKey.table ||
-          e.name.toLowerCase() === col.foreignKey.table);
+        const tgt = entityByTableName.get(col.foreignKey.table)
+          || entityByLowerName.get(col.foreignKey.table);
         if (!tgt || tgt.name === entity.name) return;
 
         const key = \`fk:\${entity.name}:\${col.name}\`;
@@ -1155,7 +1321,7 @@ function renderRels() {
         drawn.add(key);
 
         const label = col.name + ' → ' + col.foreignKey.table + '.' + col.foreignKey.column;
-        drawRelEdge(svg, entity.name, tgt.name, 'many', 'one', FK_COLOR, false, label, 'fk');
+        drawRelEdge(svg, entity.name, tgt.name, 'many', 'one', FK_COLOR, false, label, 'fk', cachedObstacles);
         relCount++;
       });
     }
@@ -1163,9 +1329,8 @@ function renderRels() {
     // ── Eloquent model relationships ──
     if (relFilter === 'both' || relFilter === 'eloquent') {
       entity.relationships.forEach(rel => {
-        const tgt = schema.entities.find(e =>
-          e.name === rel.relatedModel ||
-          e.tableName === (rel.relatedModel.toLowerCase() + 's'));
+        const tgt = entityByName.get(rel.relatedModel)
+          || entityByTableName.get(rel.relatedModel.toLowerCase() + 's');
         if (!tgt || tgt.name === entity.name) return;
 
         const key = \`rel:\${entity.name}:\${rel.name}\`;
@@ -1174,20 +1339,30 @@ function renderRels() {
 
         // Source card = entity, determine cardinality from relationship type
         const srcCard =
+          rel.type === 'belongsToMany' ? 'many' :
           ['hasMany','morphMany','hasManyThrough','hasOne','hasOneThrough'].includes(rel.type) ? 'one' :
           ['belongsTo','morphTo'].includes(rel.type) ? 'many' : 'many';
         const tgtCard =
+          rel.type === 'belongsToMany' ? 'many' :
           ['hasMany','morphMany','hasManyThrough'].includes(rel.type) ? 'many' :
           ['hasOne','hasOneThrough'].includes(rel.type) ? 'one' :
           ['belongsTo','morphTo'].includes(rel.type) ? 'one' : 'many';
 
-        drawRelEdge(svg, entity.name, tgt.name, srcCard, tgtCard, REL_COLOR, true, rel.type, 'eloquent');
+        drawRelEdge(svg, entity.name, tgt.name, srcCard, tgtCard, REL_COLOR, true, rel.type, 'eloquent', cachedObstacles);
         relCount++;
       });
     }
   });
 
   document.getElementById('status-rels').textContent = relCount + ' relationships';
+}
+
+function scheduleRenderRels() {
+  if (renderRelsFrame !== null) return;
+  renderRelsFrame = requestAnimationFrame(() => {
+    renderRelsFrame = null;
+    renderRels();
+  });
 }
 
 // ─────────────────────────────────────────────────
@@ -1215,7 +1390,7 @@ document.addEventListener('mousemove', e => {
     const card = document.querySelector(\`[data-entity="\${drag.entityName}"]\`);
     if (card) { card.style.left = nx + 'px'; card.style.top = ny + 'px'; }
     syncCanvasBounds();
-    renderRels();
+    scheduleRenderRels();
   }
 });
 
@@ -1243,13 +1418,17 @@ function applyTransform() {
 
 function startCardDrag(e, entityName, pos) {
   e.preventDefault();
+  if (dragCleanup) { dragCleanup(); dragCleanup = null; }
   drag = { type: 'card', entityName, startX: e.clientX, startY: e.clientY, origX: pos.x, origY: pos.y };
   const card = document.querySelector(\`[data-entity="\${entityName}"]\`);
   if (card) card.classList.add('dragging');
-  document.addEventListener('mouseup', function onUp() {
+  const onUp = () => {
     if (card) card.classList.remove('dragging');
     document.removeEventListener('mouseup', onUp);
-  }, { once: true });
+    dragCleanup = null;
+  };
+  dragCleanup = onUp;
+  document.addEventListener('mouseup', onUp, { once: true });
 }
 
 // ─────────────────────────────────────────────────
@@ -1302,7 +1481,8 @@ document.getElementById('rel-toggle').addEventListener('click', e => {
 
 // ── Relationship line hover tooltip ──
 const tooltip = document.getElementById('rel-tooltip');
-document.addEventListener('mousemove', e => {
+const relSvgEl = document.getElementById('rel-svg');
+relSvgEl.addEventListener('mousemove', e => {
   const g = e.target.closest && e.target.closest('.rel-group');
   if (!g) { tooltip.style.display = 'none'; return; }
   const src = g.dataset.src;
@@ -1318,8 +1498,16 @@ document.addEventListener('mousemove', e => {
   tooltip.style.left = (e.clientX + 12) + 'px';
   tooltip.style.top  = (e.clientY + 12) + 'px';
 });
+relSvgEl.addEventListener('mouseleave', () => {
+  tooltip.style.display = 'none';
+});
 
 function exportSvg() {
+  // Issue #25: Guard against empty schema.
+  if (!schema.entities.length) {
+    return;
+  }
+
   // Collect relationship paths + generate a full SVG snapshot
   const relSvg = document.getElementById('rel-svg');
   const paths = Array.from(relSvg.children).map(c => c.outerHTML).join('\\n  ');
@@ -1378,7 +1566,6 @@ function iconBtn(text, onClick) {
   return b;
 }
 
-setTimeout(fitToScreen, 200);
 </script>
 </body>
 </html>`;

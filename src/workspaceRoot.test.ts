@@ -51,6 +51,27 @@ describe('resolveWorkspaceRoot', () => {
     expect(resolved).toBe(laravelProject);
   });
 
+  it('test_resolveWorkspaceRoot_nestedLaravelFolders_prefersDeepestActiveFolder', () => {
+    const parentProject = makeTempDir('laravel-erd-parent-');
+    const nestedProject = path.join(parentProject, 'packages', 'billing');
+    tempDirs.push(parentProject);
+
+    touch(path.join(parentProject, 'artisan'));
+    touch(path.join(nestedProject, 'artisan'));
+
+    const workspaceFolders = [
+      makeWorkspaceFolder(parentProject),
+      makeWorkspaceFolder(nestedProject),
+    ];
+
+    const resolved = resolveWorkspaceRoot(
+      workspaceFolders,
+      path.join(nestedProject, 'app', 'Models', 'Invoice.php')
+    );
+
+    expect(resolved).toBe(nestedProject);
+  });
+
   it('falls back to the first Laravel workspace folder when there is no active file', () => {
     const nonLaravelProject = makeTempDir('laravel-erd-other-');
     const laravelProject = makeTempDir('laravel-erd-app-');

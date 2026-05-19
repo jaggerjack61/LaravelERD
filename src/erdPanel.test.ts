@@ -168,6 +168,44 @@ describe('erdPanel.ts source verification', () => {
     expect(erdPanelSrc).toContain('// Issue #25: Guard against empty schema');
     expect(erdPanelSrc).toContain('if (!schema.entities.length) {');
   });
+
+  // Security fix: CSP nonce is generated with a CSPRNG (crypto.randomBytes),
+  // not Math.random().
+  it('getNonce uses crypto.randomBytes (CSPRNG) instead of Math.random', () => {
+    expect(erdPanelSrc).toContain("import * as crypto from 'crypto'");
+    expect(erdPanelSrc).toContain('crypto.randomBytes(');
+    expect(erdPanelSrc).not.toMatch(/Math\.random\(\)\s*\*\s*chars\.length/);
+  });
+
+  // Bug fix: isPathInsideWorkspace must resolve relative paths against the
+  // workspace, not process.cwd(), so the security check can't be bypassed
+  // by sending a relative path from the webview.
+  it('isPathInsideWorkspace resolves relative paths against the workspace', () => {
+    expect(erdPanelSrc).toContain('path.isAbsolute(candidatePath)');
+    expect(erdPanelSrc).toContain('path.resolve(workspaceResolved, candidatePath)');
+  });
+
+  it('createOrShow recreates the panel when the requested workspace changes', () => {
+    expect(erdPanelSrc).toContain('ErdPanel.currentPanel.workspacePath');
+    expect(erdPanelSrc).toContain('path.resolve(workspacePath)');
+    expect(erdPanelSrc).toContain('ErdPanel.currentPanel.panel.dispose();');
+  });
+
+  it('dispose only cleans resources after the panel has already been disposed', () => {
+    const disposeBody = erdPanelSrc.match(/private dispose\(\): void \{[\s\S]*?\n  \}/)?.[0] ?? '';
+    expect(disposeBody).not.toContain('this.panel.dispose()');
+    expect(disposeBody).toContain('this.disposables');
+  });
+
+  // Perf fix: renderRels pre-builds lookup maps for entity targets so each
+  // FK / Eloquent edge resolution is O(1) rather than O(N) per edge.
+  it('renderRels uses lookup Maps instead of schema.entities.find per edge', () => {
+    expect(erdPanelSrc).toContain('entityByTableName = new Map()');
+    expect(erdPanelSrc).toContain('entityByName = new Map()');
+    expect(erdPanelSrc).toContain('entityByLowerName = new Map()');
+    expect(erdPanelSrc).toContain('entityByTableName.get(col.foreignKey.table)');
+    expect(erdPanelSrc).toContain('entityByName.get(rel.relatedModel)');
+  });
 });
 
 describe('extension.ts source verification', () => {
@@ -227,5 +265,26 @@ describe('parser.ts source verification', () => {
   it('#21: joinMultilineChains function exists', () => {
     expect(parserSrc).toContain('function joinMultilineChains');
     expect(parserSrc).toContain('joinMultilineChains(content)');
+  });
+
+  // Perf fix: collectPhpFiles avoids the redundant per-entry fs.stat call
+  // by trusting the Dirent metadata from `withFileTypes: true`.
+  it('collectPhpFiles uses Dirent.isDirectory()/isFile() (no redundant stat)', () => {
+    expect(parserSrc).toContain('entry.isDirectory()');
+    expect(parserSrc).toContain('entry.isFile()');
+    expect(parserSrc).not.toMatch(/const\s+entryStat\s*=\s*await\s+fsp\.stat\(fullPath\)/);
+  });
+
+  // Perf fix: migration files are read in parallel via Promise.all instead of
+  // a serial await loop.
+  it('parseProject reads migration files in parallel', () => {
+    expect(parserSrc).toContain('Promise.all(');
+    expect(parserSrc).toContain('files.map(async');
+  });
+
+  it('parseProject reads model files in parallel and merges through lookup maps', () => {
+    expect(parserSrc).toContain('modelFileContents = await Promise.all(');
+    expect(parserSrc).toContain('entityByName = new Map');
+    expect(parserSrc).toContain('entityByTableName = new Map');
   });
 });

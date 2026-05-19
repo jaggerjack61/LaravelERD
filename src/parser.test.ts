@@ -1,5 +1,28 @@
-import { describe, it, expect, vi } from 'vitest';
-import { classToTable, parseMigration, parseModel } from './parser';
+import { afterEach, describe, it, expect } from 'vitest';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import { classToTable, parseMigration, parseModel, parseProject } from './parser';
+
+function makeTempDir(prefix: string): string {
+  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+}
+
+function writeFile(filePath: string, content: string): void {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, content, 'utf8');
+}
+
+const tempDirs: string[] = [];
+
+afterEach(() => {
+  while (tempDirs.length > 0) {
+    const dir = tempDirs.pop();
+    if (dir && fs.existsSync(dir)) {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
 
 // ─────────────────────────────────────────────────────
 // Issue #9 — classToTable should handle irregular plurals
@@ -213,6 +236,19 @@ class SomeHelper {
     expect(result).toBeNull();
   });
 
+  it('records pending foreign keys when the column is not declared in the same file', () => {
+    const content = `<?php
+Schema::table('orders', function (Blueprint $table) {
+    $table->foreign('user_id')->references('id')->on('users');
+});`;
+    const result = parseMigration(content, '/migrations/alter_orders.php');
+    expect(result).not.toBeNull();
+    expect(result!.columns.find(c => c.name === 'user_id')).toBeUndefined();
+    expect(result!.pendingForeignKeys).toEqual([
+      { column: 'user_id', references: { table: 'users', column: 'id' } },
+    ]);
+  });
+
   it('handles multiline nullable() on generic column', () => {
     const content = `<?php
 Schema::create('posts', function (Blueprint $table) {
@@ -294,10 +330,200 @@ class User extends Model {
     expect(result!.relationships!.map(r => r.type)).toEqual(['hasMany', 'hasOne', 'belongsToMany']);
   });
 
+  it('test_parseModel_fullyQualifiedRelationshipClass_extractsBaseModelName', () => {
+    const content = `<?php
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+
+class Post extends Model {
+    public function author()
+    {
+        return $this->belongsTo(\\App\\Models\\User::class);
+    }
+}`;
+    const result = parseModel(content, '/app/Models/Post.php');
+    expect(result).not.toBeNull();
+    expect(result!.relationships).toEqual([
+      { name: 'author', type: 'belongsTo', relatedModel: 'User' },
+    ]);
+  });
+
+  it('test_parseModel_morphToWithoutClass_recordsPolymorphicRelationship', () => {
+    const content = `<?php
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+
+class Comment extends Model {
+    public function commentable()
+    {
+        return $this->morphTo();
+    }
+}`;
+    const result = parseModel(content, '/app/Models/Comment.php');
+    expect(result).not.toBeNull();
+    expect(result!.relationships).toEqual([
+      { name: 'commentable', type: 'morphTo', relatedModel: 'commentable' },
+    ]);
+  });
+
   it('returns null for files without class extending Model', () => {
     const content = `<?php
 function helper() { return 'hi'; }`;
     const result = parseModel(content, '/app/helpers.php');
     expect(result).toBeNull();
+  });
+
+  it('skips controller classes', () => {
+    const content = `<?php
+namespace App\Http\Controllers;
+
+class UserController extends Controller {
+    public function index() {}
+}`;
+    const result = parseModel(content, '/app/Http/Controllers/UserController.php');
+    expect(result).toBeNull();
+  });
+});
+
+// ─────────────────────────────────────────────────────
+// parseProject
+// ─────────────────────────────────────────────────────
+describe('parseProject', () => {
+  it('test_parseProject_mergesAlterMigrations_addsColumnsToExistingEntity', async () => {
+    const workspace = makeTempDir('laravel-erd-parser-');
+    tempDirs.push(workspace);
+
+    writeFile(path.join(workspace, 'database', 'migrations', '2024_01_01_000000_create_posts.php'), `<?php
+Schema::create('posts', function (Blueprint $table) {
+    $table->id();
+    $table->string('title');
+});`);
+    writeFile(path.join(workspace, 'database', 'migrations', '2024_01_02_000000_add_excerpt_to_posts.php'), `<?php
+Schema::table('posts', function (Blueprint $table) {
+    $table->text('excerpt')->nullable();
+});`);
+
+    const schema = await parseProject(workspace);
+
+    const post = schema.entities.find(entity => entity.tableName === 'posts');
+    expect(post).toBeDefined();
+    expect(post!.columns.map(column => column.name)).toEqual(['id', 'title', 'excerpt']);
+    expect(post!.columns.find(column => column.name === 'excerpt')!.nullable).toBe(true);
+  });
+
+  it('test_parseProject_scansModelDirectories_deduplicatesNestedModels', async () => {
+    const workspace = makeTempDir('laravel-erd-parser-');
+    tempDirs.push(workspace);
+
+    writeFile(path.join(workspace, 'app', 'Models', 'User.php'), `<?php
+class User extends Model {
+    protected $fillable = ['name'];
+}`);
+    writeFile(path.join(workspace, 'app', 'Admin', 'Invoice.php'), `<?php
+class Invoice extends Model {
+    protected $fillable = ['total'];
+}`);
+
+    const schema = await parseProject(workspace);
+
+    expect(schema.entities.filter(entity => entity.name === 'User')).toHaveLength(1);
+    expect(schema.entities.map(entity => entity.name).sort()).toEqual(['Invoice', 'User']);
+  });
+
+  // Bug fix: standalone `$table->foreign(...)` in an alter migration whose
+  // column was defined in another migration must still produce a FK.
+  it('merges foreign() declarations from later alter migrations onto existing columns', async () => {
+    const workspace = makeTempDir('laravel-erd-parser-');
+    tempDirs.push(workspace);
+
+    writeFile(path.join(workspace, 'database', 'migrations', '2024_01_01_000000_create_users.php'), `<?php
+Schema::create('users', function (Blueprint $table) {
+    $table->id();
+});`);
+    writeFile(path.join(workspace, 'database', 'migrations', '2024_01_02_000000_create_orders.php'), `<?php
+Schema::create('orders', function (Blueprint $table) {
+    $table->id();
+    $table->unsignedBigInteger('user_id');
+});`);
+    writeFile(path.join(workspace, 'database', 'migrations', '2024_01_03_000000_add_fk_to_orders.php'), `<?php
+Schema::table('orders', function (Blueprint $table) {
+    $table->foreign('user_id')->references('id')->on('users');
+});`);
+
+    const schema = await parseProject(workspace);
+    const orders = schema.entities.find(e => e.tableName === 'orders')!;
+    const userIdCol = orders.columns.find(c => c.name === 'user_id')!;
+    expect(userIdCol.foreignKey).toEqual({ table: 'users', column: 'id' });
+    // Pending list should be drained after merging.
+    expect(orders.pendingForeignKeys).toBeUndefined();
+  });
+
+  // Perf fix: collectPhpFiles must still pick up deeply nested model files
+  // after switching from per-entry fs.stat to Dirent-based recursion.
+  it('discovers models in deeply nested model directories', async () => {
+    const workspace = makeTempDir('laravel-erd-parser-');
+    tempDirs.push(workspace);
+
+    writeFile(path.join(workspace, 'app', 'Models', 'Billing', 'Subscription', 'Plan.php'), `<?php
+class Plan extends Model {
+    protected $fillable = ['name'];
+}`);
+
+    const schema = await parseProject(workspace);
+    expect(schema.entities.find(e => e.name === 'Plan')).toBeDefined();
+  });
+
+  it('does not include controllers from app fallback scanning', async () => {
+    const workspace = makeTempDir('laravel-erd-parser-');
+    tempDirs.push(workspace);
+
+    writeFile(path.join(workspace, 'app', 'Models', 'User.php'), `<?php
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+
+class User extends Model {
+    protected $fillable = ['name'];
+}`);
+    writeFile(path.join(workspace, 'app', 'Http', 'Controllers', 'UserController.php'), `<?php
+namespace App\Http\Controllers;
+
+class UserController extends Controller {
+    public function index() {}
+}`);
+
+    const schema = await parseProject(workspace);
+
+    expect(schema.entities.map(entity => entity.name)).toEqual(['User']);
+  });
+
+  it('test_parseProject_singleMigrationWithMultipleSchemaBlocks_createsSeparateEntities', async () => {
+    const workspace = makeTempDir('laravel-erd-parser-');
+    tempDirs.push(workspace);
+
+    writeFile(path.join(workspace, 'database', 'migrations', '2024_01_01_000000_create_users_and_posts.php'), `<?php
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+Schema::create('users', function (Blueprint $table) {
+    $table->id();
+    $table->string('name');
+});
+
+Schema::create('posts', function (Blueprint $table) {
+    $table->id();
+    $table->string('title');
+});`);
+
+    const schema = await parseProject(workspace);
+    const users = schema.entities.find(entity => entity.tableName === 'users');
+    const posts = schema.entities.find(entity => entity.tableName === 'posts');
+
+    expect(users).toBeDefined();
+    expect(posts).toBeDefined();
+    expect(users!.columns.map(column => column.name)).toEqual(['id', 'name']);
+    expect(posts!.columns.map(column => column.name)).toEqual(['id', 'title']);
   });
 });
