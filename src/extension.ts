@@ -32,7 +32,7 @@ export function activate(context: vscode.ExtensionContext): void {
           'Laravel ERD: No artisan file detected. Make sure this is a Laravel project.'
         );
       }
-      ErdPanel.createOrShow(context.extensionUri, workspaceRoot);
+      ErdPanel.createOrShow(context.extensionUri, workspaceRoot, context.workspaceState);
     })
   );
 

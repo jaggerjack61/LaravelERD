@@ -64,6 +64,10 @@ describe('erdPanel.ts source verification', () => {
   const erdPanelSrc = fs.readFileSync(
     path.join(__dirname, 'erdPanel.ts'), 'utf8'
   );
+  // The webview script lives in its own file and is loaded by ErdPanel.getHtml().
+  const webviewSrc = fs.readFileSync(
+    path.join(__dirname, '..', 'media', 'webview', 'erd.js'), 'utf8'
+  );
 
   // Issue #15: doRefresh must await withProgress
   it('#15: doRefresh awaits withProgress', () => {
@@ -103,70 +107,70 @@ describe('erdPanel.ts source verification', () => {
   // Issue #13: No innerHTML in buildEditRow
   it('#13: buildEditRow uses safe DOM instead of innerHTML', () => {
     // The old innerHTML pattern should not exist
-    expect(erdPanelSrc).not.toContain("nullLbl.innerHTML = '<input");
-    expect(erdPanelSrc).not.toContain("uniqLbl.innerHTML = '<input");
+    expect(webviewSrc).not.toContain("nullLbl.innerHTML = '<input");
+    expect(webviewSrc).not.toContain("uniqLbl.innerHTML = '<input");
     // Should use createElement instead
-    expect(erdPanelSrc).toContain("nullCb.type = 'checkbox'");
-    expect(erdPanelSrc).toContain("uniqCb.type = 'checkbox'");
+    expect(webviewSrc).toContain("nullCb.type = 'checkbox'");
+    expect(webviewSrc).toContain("uniqCb.type = 'checkbox'");
   });
 
   // Issue #14: startCardDrag cleanup
   it('#14: startCardDrag has dragCleanup mechanism', () => {
-    expect(erdPanelSrc).toContain('dragCleanup');
-    expect(erdPanelSrc).toContain('if (dragCleanup) { dragCleanup(); dragCleanup = null; }');
+    expect(webviewSrc).toContain('dragCleanup');
+    expect(webviewSrc).toContain('if (dragCleanup) { dragCleanup(); dragCleanup = null; }');
   });
 
   // Issue #1: Diff-based renderCards
   it('#1: renderCards uses diff-based approach', () => {
-    expect(erdPanelSrc).toContain('existingCards');
-    expect(erdPanelSrc).toContain('canvas.replaceChild(newCard, existingCard)');
+    expect(webviewSrc).toContain('existingCards');
+    expect(webviewSrc).toContain('.replaceChild(newCard, existingCard)');
     // Should NOT have the old nuke-all pattern
-    expect(erdPanelSrc).not.toContain("Array.from(canvas.children).forEach(c => { if (c !== svg) c.remove(); })");
+    expect(webviewSrc).not.toContain("Array.from(canvas.children).forEach(c => { if (c !== svg) c.remove(); })");
   });
 
   // Issue #2: Throttled renderRels during drag
   it('#2: card drag uses scheduleRenderRels instead of direct renderRels', () => {
-    expect(erdPanelSrc).toContain('scheduleRenderRels');
-    expect(erdPanelSrc).toContain('requestAnimationFrame');
+    expect(webviewSrc).toContain('scheduleRenderRels');
+    expect(webviewSrc).toContain('requestAnimationFrame');
   });
 
   // Issue #3: Obstacles are cached per renderRels call
   it('#3: obstacles are computed once per renderRels', () => {
-    expect(erdPanelSrc).toContain('computeAllObstacles');
-    expect(erdPanelSrc).toContain('cachedObstacles');
+    expect(webviewSrc).toContain('computeAllObstacles');
+    expect(webviewSrc).toContain('cachedObstacles');
   });
 
   // Issue #6: Tooltip only listens on SVG, not entire document
   it('#6: tooltip mousemove is scoped to SVG element', () => {
-    expect(erdPanelSrc).toContain("relSvgEl.addEventListener('mousemove'");
-    expect(erdPanelSrc).toContain("relSvgEl.addEventListener('mouseleave'");
+    expect(webviewSrc).toContain("relSvgEl.addEventListener('mousemove'");
+    expect(webviewSrc).toContain("relSvgEl.addEventListener('mouseleave'");
   });
 
   // Issue #19: Position migration for renamed entities
   it('#19: schema handler migrates positions for renamed entities', () => {
-    expect(erdPanelSrc).toContain('// Issue #19: Migrate positions when entity names change');
+    expect(webviewSrc).toContain('// Issue #19: Migrate positions when entity names change');
   });
 
   // Issue #20: belongsToMany explicitly handled
   it('#20: belongsToMany explicitly in cardinality chains', () => {
-    expect(erdPanelSrc).toContain("rel.type === 'belongsToMany' ? 'many'");
+    expect(webviewSrc).toContain("rel.type === 'belongsToMany' ? 'many'");
   });
 
   // Issue #24: fitToScreen called after schema arrives
   it('#24: fitToScreen called in schema handler, not on a timer', () => {
     // The old code used setTimeout(fitToScreen, 200); at the bottom as executable code.
     // Now it should only appear in a comment referencing the removal.
-    const lines = erdPanelSrc.split('\n').filter(l => !l.trim().startsWith('//'));
+    const lines = webviewSrc.split('\n').filter(l => !l.trim().startsWith('//'));
     const codeOnly = lines.join('\n');
     expect(codeOnly).not.toContain('setTimeout(fitToScreen');
     // Should call fitToScreen in the schema handler
-    expect(erdPanelSrc).toContain("// Issue #24: Call fitToScreen after schema is loaded");
+    expect(webviewSrc).toContain("// Issue #24: Call fitToScreen after schema is loaded");
   });
 
   // Issue #25: Empty schema guard in exportSvg
   it('#25: exportSvg guards against empty schema', () => {
-    expect(erdPanelSrc).toContain('// Issue #25: Guard against empty schema');
-    expect(erdPanelSrc).toContain('if (!schema.entities.length) {');
+    expect(webviewSrc).toContain('// Issue #25: Guard against empty schema');
+    expect(webviewSrc).toContain('if (!schema.entities.length) {');
   });
 
   // Security fix: CSP nonce is generated with a CSPRNG (crypto.randomBytes),
@@ -197,14 +201,14 @@ describe('erdPanel.ts source verification', () => {
     expect(disposeBody).toContain('this.disposables');
   });
 
-  // Perf fix: renderRels pre-builds lookup maps for entity targets so each
+  // Perf fix: collectEdges pre-builds lookup maps for entity targets so each
   // FK / Eloquent edge resolution is O(1) rather than O(N) per edge.
-  it('renderRels uses lookup Maps instead of schema.entities.find per edge', () => {
-    expect(erdPanelSrc).toContain('entityByTableName = new Map()');
-    expect(erdPanelSrc).toContain('entityByName = new Map()');
-    expect(erdPanelSrc).toContain('entityByLowerName = new Map()');
-    expect(erdPanelSrc).toContain('entityByTableName.get(col.foreignKey.table)');
-    expect(erdPanelSrc).toContain('entityByName.get(rel.relatedModel)');
+  it('collectEdges uses lookup Maps instead of schema.entities.find per edge', () => {
+    expect(webviewSrc).toContain('entityByTableName = new Map()');
+    expect(webviewSrc).toContain('entityByName = new Map()');
+    expect(webviewSrc).toContain('entityByLowerName = new Map()');
+    expect(webviewSrc).toContain('entityByTableName.get(col.foreignKey.table)');
+    expect(webviewSrc).toContain('entityByName.get(rel.relatedModel)');
   });
 });
 
